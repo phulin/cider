@@ -1,0 +1,25 @@
+{
+	"name": "@cider/web",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "vinxi dev",
+		"build": "vinxi build",
+		"start": "vinxi start",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@cider/shared": "workspace:*",
+		"@solidjs/router": "^0.15.0",
+		"@solidjs/start": "^1.0.0",
+		"solid-js": "^1.9.0",
+		"vinxi": "^0.5.0"
+	},
+	"devDependencies": {
+		"@tailwindcss/vite": "^4.0.0",
+		"autoprefixer": "^10.4.20",
+		"tailwindcss": "^4.0.0",
+		"typescript": "^5.7.0"
+	}
+}

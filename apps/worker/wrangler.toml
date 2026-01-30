@@ -1,0 +1,14 @@
+name = "cider-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-30"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "development"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "cider-documents"
+
+# For local development, create a preview bucket
+# Run: wrangler r2 bucket create cider-documents
