@@ -32,6 +32,11 @@ const verdictConfig: Record<
 		color: "text-gray-600",
 		bg: "bg-gray-50 border-gray-200",
 	},
+	not_applicable: {
+		label: "Not Applicable",
+		color: "text-cyan-700",
+		bg: "bg-cyan-50 border-cyan-200",
+	},
 };
 
 function FootnoteCard(props: {
@@ -281,6 +286,7 @@ export default function DocumentPage() {
 			does_not_support: 0,
 			contradicts: 0,
 			source_unavailable: 0,
+			not_applicable: 0,
 		};
 
 		for (const v of verifications) {

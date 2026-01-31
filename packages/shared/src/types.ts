@@ -22,7 +22,8 @@ export type Verdict =
 	| "partially_supports"
 	| "does_not_support"
 	| "contradicts"
-	| "source_unavailable";
+	| "source_unavailable"
+	| "not_applicable";
 
 export interface SourceResult {
 	url?: string;

@@ -10,24 +10,11 @@ import {
 	GoogleGenAI,
 	Type,
 } from "@google/genai";
-import { parseHTML } from "linkedom";
-import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
-
-// Context for the current document - passed to verification functions
-interface VerificationContext {
-	allFootnotes: Footnote[];
-	currentIndex: number;
-}
+import { toolDefinitions } from "./verify/tools/definitions";
+import { createToolHandler } from "./verify/tools/handlers";
+import type { VerificationContext } from "./verify/types";
 
 const MODEL_NAME = "gemini-3-flash-preview";
-const MAX_WEB_SEARCH_CHARS = 10000;
-const MAX_PDF_PAGE_CHARS = 12000;
-const PDF_CACHE_LIMIT = 3;
-
-GlobalWorkerOptions.workerSrc = "";
-
-// Simple in-memory cache for PDF bytes; swap to R2 if persistence is needed.
-const pdfCache = new Map<string, ArrayBuffer>();
 
 const VERIFICATION_SYSTEM_PROMPT = `You are an expert citation verification assistant. Your job is to rigorously verify that cited sources actually support the claims they're attached to.
 
@@ -51,9 +38,15 @@ CRITICAL INSTRUCTIONS:
    - web_search: Search for sources by title, author, or key phrases
    - read_url: Fetch and read content from URLs
    - read_pdf_page: Extract text from a specific PDF page (PDF page numbers may not match citation page numbering)
-   - get_earlier_footnotes: Retrieve earlier footnotes for cross-references
+   - get_earlier_footnotes: Retrieve a specific earlier footnote by index for cross-references (must choose the index)
 
-5. **For each source you find**, determine:
+5. **Source fidelity requirements**:
+   - Use web_search ONLY to locate original sources; do not use search result summaries or snippets to verify claims.
+   - Your goal is to find the precise page or piece of text referenced in the footnote and decide whether it supports the claim.
+   - If a footnote has no sources (only explanatory text), return "not_applicable".
+   - If you cannot confidently access the original source text, return "source_unavailable".
+
+6. **For each source you find**, determine:
    - Does it DIRECTLY support the specific claim?
    - Does it only PARTIALLY support (supports a related but not identical claim)?
    - Does it NOT SUPPORT (discusses the topic but doesn't back up this claim)?
@@ -66,11 +59,11 @@ After thoroughly investigating, respond with ONLY a JSON object:
       "title": "Source title or description",
       "url": "URL if found",
       "accessed": true/false,
-      "verdict": "supports" | "partially_supports" | "does_not_support" | "contradicts" | "source_unavailable",
+      "verdict": "supports" | "partially_supports" | "does_not_support" | "contradicts" | "source_unavailable" | "not_applicable",
       "explanation": "Brief explanation for this specific source"
     }
   ],
-  "overall_verdict": "supports" | "partially_supports" | "does_not_support" | "contradicts" | "source_unavailable",
+  "overall_verdict": "supports" | "partially_supports" | "does_not_support" | "contradicts" | "source_unavailable" | "not_applicable",
   "confidence": 0.0-1.0,
   "explanation": "Overall assessment considering all sources"
 }
@@ -82,96 +75,7 @@ IMPORTANT:
 
 const VERIFICATION_CACHE_TTL = "3600s";
 
-const tools = [
-	{
-		functionDeclarations: [
-			{
-				name: "web_search",
-				description:
-					"Search the web for information about a citation, source, article, paper, or book. Use this to find URLs for sources, find archived versions of dead links, or locate academic papers by title/author.",
-				parameters: {
-					type: Type.OBJECT,
-					properties: {
-						query: {
-							type: Type.STRING,
-							description:
-								"Search query - be specific with titles, authors, publication names",
-						},
-					},
-					required: ["query"],
-				},
-			},
-		],
-	},
-	{
-		functionDeclarations: [
-			{
-				name: "read_url",
-				description:
-					"Fetch and read the content of a URL. Use this to access web pages, articles, papers (if open access), and other online sources.",
-				parameters: {
-					type: Type.OBJECT,
-					properties: {
-						url: {
-							type: Type.STRING,
-							description: "URL to fetch and read",
-						},
-					},
-					required: ["url"],
-				},
-			},
-		],
-	},
-	{
-		functionDeclarations: [
-			{
-				name: "read_pdf_page",
-				description:
-					"Download a PDF and extract text from a specific page. Page numbers are 1-based and follow the PDF's internal order (this may NOT match citation page numbering).",
-				parameters: {
-					type: Type.OBJECT,
-					properties: {
-						url: {
-							type: Type.STRING,
-							description: "PDF URL to download",
-						},
-						page: {
-							type: Type.NUMBER,
-							description:
-								"Page number to extract (1-based; PDF internal order)",
-						},
-					},
-					required: ["url", "page"],
-				},
-			},
-		],
-	},
-	{
-		functionDeclarations: [
-			{
-				name: "get_earlier_footnotes",
-				description:
-					"Retrieve earlier footnotes from the document. Use this when the current citation references earlier footnotes with 'Id.', 'Ibid.', 'supra note X', or similar cross-references.",
-				parameters: {
-					type: Type.OBJECT,
-					properties: {
-						count: {
-							type: Type.NUMBER,
-							description:
-								"Number of earlier footnotes to retrieve (1-10). For 'Id.', use 1. For 'supra note X', retrieve from footnote 1 up to the current one.",
-						},
-						specific_index: {
-							type: Type.NUMBER,
-							description:
-								"Optional: retrieve a specific footnote by its number (e.g., for 'supra note 5', use 5)",
-						},
-					},
-					required: ["count"],
-				},
-			},
-		],
-	},
-];
+const tools = toolDefinitions;
 
 const verificationResponseSchema = {
 	type: Type.OBJECT,
@@ -256,295 +160,6 @@ async function getVerificationCacheName(
 	return pending;
 }
 
-/**
- * Perform a web search using Linkup
- */
-async function performWebSearch(query: string): Promise<string> {
-	const apiKey = currentLinkupApiKey;
-	if (!apiKey) {
-		return "Search unavailable: LINKUP_API_KEY is not set.";
-	}
-
-	try {
-		const startedAt = Date.now();
-		const response = await fetchWithTimeout(
-			"https://api.linkup.so/v1/search",
-			15000,
-			{
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${apiKey}`,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({
-					q: query,
-					depth: "standard",
-					outputType: "searchResults",
-					includeImages: false,
-					maxResults: 5,
-				}),
-			},
-		);
-		console.log(
-			`[verify] web_search "${query}" -> ${response.status} in ${Date.now() - startedAt}ms`,
-		);
-
-		if (!response.ok) {
-			const detail = await response.text().catch(() => "");
-			const suffix = detail ? ` (${detail.slice(0, 200)})` : "";
-			return `Search failed with status ${response.status}${suffix}. Try a different search query.`;
-		}
-
-		const data = (await response.json()) as {
-			results?: Array<{
-				type?: string;
-				name?: string;
-				url?: string;
-				content?: string;
-			}>;
-		};
-
-		const results: string[] = [];
-
-		if (data.results && data.results.length > 0) {
-			results.push("**Results:**");
-			data.results.slice(0, 5).forEach((r, i) => {
-				const title = r.name || "Result";
-				const url = r.url || "";
-				const content = r.content ? `\n   ${r.content}` : "";
-				results.push(`${i + 1}. ${title}\n   ${url}${content}`);
-			});
-		}
-
-		if (results.length === 0) {
-			return `No results found for "${query}". Try:\n- Different keywords\n- Author names + title\n- Removing special characters\n- Searching for the publication name`;
-		}
-
-		const output = results.join("\n");
-		if (output.length > MAX_WEB_SEARCH_CHARS) {
-			const truncated = output.slice(0, MAX_WEB_SEARCH_CHARS);
-			return `${truncated}\n\n[Results truncated to ${MAX_WEB_SEARCH_CHARS} characters]`;
-		}
-		return output;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "Unknown error";
-		console.log(`[verify] web_search "${query}" failed in error: ${message}`);
-		return `Search error: ${error instanceof Error ? error.message : "Unknown error"}. Try a simpler query.`;
-	}
-}
-
-/**
- * Fetch a URL and extract its text content
- */
-async function fetchAndExtractText(url: string): Promise<string> {
-	try {
-		const startedAt = Date.now();
-		// Clean up URL if needed
-		let cleanUrl = url.trim();
-		if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
-			cleanUrl = `https://${cleanUrl}`;
-		}
-
-		const response = await fetchWithTimeout(cleanUrl, 15000, {
-			headers: {
-				"User-Agent":
-					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-				Accept:
-					"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.9",
-			},
-			redirect: "follow",
-		});
-		console.log(
-			`[verify] read_url "${cleanUrl}" -> ${response.status} in ${Date.now() - startedAt}ms`,
-		);
-
-		if (!response.ok) {
-			if (response.status === 403 || response.status === 401) {
-				return `Access denied (HTTP ${response.status}). This may be a paywalled source. Try searching for an open access version.`;
-			}
-			if (response.status === 404) {
-				return `Page not found (HTTP 404). The URL may be outdated. Try searching for the article by title.`;
-			}
-			return `Failed to fetch URL: HTTP ${response.status}. Try searching for an alternate source.`;
-		}
-
-		const contentType = response.headers.get("content-type") || "";
-
-		if (contentType.includes("application/pdf")) {
-			return "PDF detected. Use read_pdf_page with the URL and a page number to extract text. Note: citation page numbers may not match the PDF's internal page order.";
-		}
-
-		const html = await response.text();
-		const { document } = parseHTML(html);
-
-		// Remove non-content elements
-		document
-			.querySelectorAll(
-				"script, style, nav, footer, header, aside, .ad, .advertisement, .sidebar, .menu, .navigation",
-			)
-			.forEach((el: Element) => {
-				el.remove();
-			});
-
-		// Try to find main content area
-		const contentSelectors = [
-			"article",
-			"main",
-			".article-content",
-			".post-content",
-			".entry-content",
-			".content",
-			"#content",
-			".article-body",
-			".story-body",
-			"[role='main']",
-		];
-
-		let mainContent = null;
-		for (const selector of contentSelectors) {
-			mainContent = document.querySelector(selector);
-			if (mainContent) break;
-		}
-
-		if (!mainContent) {
-			mainContent = document.body;
-		}
-
-		// Extract title
-		const title =
-			document.querySelector("title")?.textContent?.trim() ||
-			document.querySelector("h1")?.textContent?.trim() ||
-			"Untitled";
-
-		const text = mainContent?.textContent?.trim() || "";
-
-		// Clean up whitespace
-		const cleanedText = text.replace(/\s+/g, " ").replace(/\n\s*\n/g, "\n\n");
-
-		// Truncate to reasonable size for LLM context
-		const maxLength = 20000;
-		const truncated = cleanedText.slice(0, maxLength);
-
-		let result = `**Title**: ${title}\n**URL**: ${cleanUrl}\n\n**Content**:\n${truncated}`;
-
-		if (truncated.length < cleanedText.length) {
-			result += "\n\n[Content truncated - showing first 20,000 characters]";
-		}
-
-		if (truncated.length < 500) {
-			result +=
-				"\n\n[Note: Very little content extracted. This may be a paywall, JavaScript-heavy site, or redirect page. Try searching for the content elsewhere.]";
-		}
-
-		return (
-			result || "No text content found. Try searching for this source by title."
-		);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "Unknown error";
-		console.log(`[verify] read_url "${url}" failed: ${message}`);
-		return `Error fetching URL: ${message}. Try searching for this source using web_search.`;
-	}
-}
-
-async function fetchPdfBytes(url: string): Promise<ArrayBuffer | string> {
-	let cleanUrl = url.trim();
-	if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
-		cleanUrl = `https://${cleanUrl}`;
-	}
-
-	const cached = pdfCache.get(cleanUrl);
-	if (cached) {
-		return cached;
-	}
-
-	const startedAt = Date.now();
-	const response = await fetchWithTimeout(cleanUrl, 20000, {
-		headers: {
-			"User-Agent":
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			Accept: "application/pdf,*/*;q=0.8",
-			"Accept-Language": "en-US,en;q=0.9",
-		},
-		redirect: "follow",
-	});
-	console.log(
-		`[verify] read_pdf_page "${cleanUrl}" -> ${response.status} in ${Date.now() - startedAt}ms`,
-	);
-
-	if (!response.ok) {
-		if (response.status === 403 || response.status === 401) {
-			return `Access denied (HTTP ${response.status}). This PDF may be paywalled.`;
-		}
-		if (response.status === 404) {
-			return "PDF not found (HTTP 404). The URL may be outdated.";
-		}
-		return `Failed to fetch PDF: HTTP ${response.status}.`;
-	}
-
-	const contentType = response.headers.get("content-type") || "";
-	if (!contentType.includes("application/pdf")) {
-		return `Expected a PDF but got content-type: ${contentType || "unknown"}.`;
-	}
-
-	const data = await response.arrayBuffer();
-	if (pdfCache.size >= PDF_CACHE_LIMIT) {
-		const oldestKey = pdfCache.keys().next().value as string | undefined;
-		if (oldestKey) {
-			pdfCache.delete(oldestKey);
-		}
-	}
-	pdfCache.set(cleanUrl, data);
-	return data;
-}
-
-async function readPdfPage(url: string, pageNumber: number): Promise<string> {
-	if (!Number.isFinite(pageNumber) || pageNumber < 1) {
-		return "Invalid page number. Provide a 1-based page number.";
-	}
-
-	const dataOrError = await fetchPdfBytes(url);
-	if (typeof dataOrError === "string") {
-		return dataOrError;
-	}
-
-	try {
-		const loadingTask = getDocument({ data: dataOrError });
-		const pdf = await loadingTask.promise;
-		const totalPages = pdf.numPages;
-		if (pageNumber > totalPages) {
-			return `PDF has ${totalPages} pages. Requested page ${pageNumber} is out of range.`;
-		}
-
-		const page = await pdf.getPage(pageNumber);
-		const textContent = (await page.getTextContent()) as {
-			items: Array<{ str?: string }>;
-		};
-		const parts = textContent.items
-			.map((item) => item.str ?? "")
-			.filter(Boolean);
-		const rawText = parts.join(" ").replace(/\s+/g, " ").trim();
-		const truncated =
-			rawText.length > MAX_PDF_PAGE_CHARS
-				? `${rawText.slice(0, MAX_PDF_PAGE_CHARS)}...`
-				: rawText;
-
-		let result = `**PDF**: ${url}\n**Page**: ${pageNumber}/${totalPages}\n\n${truncated}`;
-		if (rawText.length > MAX_PDF_PAGE_CHARS) {
-			result += `\n\n[Content truncated to ${MAX_PDF_PAGE_CHARS} characters]`;
-		}
-		if (truncated.length < 200) {
-			result +=
-				"\n\n[Note: Very little text extracted. This page may be scanned or image-based.]";
-		}
-
-		return result;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : "Unknown error";
-		return `Failed to parse PDF: ${message}`;
-	}
-}
-
 async function fetchWithTimeout(
 	input: RequestInfo | URL,
 	timeoutMs: number,
@@ -563,67 +178,11 @@ async function fetchWithTimeout(
 	}
 }
 
-/**
- * Get earlier footnotes for cross-reference resolution
- */
-function getEarlierFootnotes(count: number, specificIndex?: number): string {
-	if (!currentContext) {
-		return "No document context available.";
-	}
-
-	const { allFootnotes, currentIndex } = currentContext;
-
-	if (specificIndex !== undefined) {
-		// Get a specific footnote by index (1-based in documents)
-		const footnote = allFootnotes.find((f) => f.index === specificIndex);
-		if (footnote) {
-			const label = footnote.displayIndex ?? String(footnote.index);
-			return `**Footnote ${label}**:\nClaim: ${footnote.claim}\nCitation: ${footnote.citation}`;
-		}
-		return `Footnote ${specificIndex} not found.`;
-	}
-
-	// Get the previous N footnotes
-	const startIdx = Math.max(0, currentIndex - count);
-	const previousFootnotes = allFootnotes.slice(startIdx, currentIndex);
-
-	if (previousFootnotes.length === 0) {
-		return "No earlier footnotes available (this is the first footnote).";
-	}
-
-	const formatted = previousFootnotes
-		.map((f) => {
-			const label = f.displayIndex ?? String(f.index);
-			return `**Footnote ${label}**:\nClaim: ${f.claim}\nCitation: ${f.citation}`;
-		})
-		.join("\n\n---\n\n");
-
-	return `Earlier footnotes (${previousFootnotes.length} retrieved):\n\n${formatted}`;
-}
-
-/**
- * Handle tool calls from Gemini
- */
-async function handleToolCall(
-	name: string,
-	args: Record<string, unknown>,
-): Promise<string> {
-	switch (name) {
-		case "web_search":
-			return await performWebSearch(args.query as string);
-		case "read_url":
-			return await fetchAndExtractText(args.url as string);
-		case "read_pdf_page":
-			return await readPdfPage(args.url as string, args.page as number);
-		case "get_earlier_footnotes":
-			return getEarlierFootnotes(
-				(args.count as number) || 1,
-				args.specific_index as number | undefined,
-			);
-		default:
-			return `Unknown tool: ${name}`;
-	}
-}
+const handleToolCall = createToolHandler({
+	fetchWithTimeout,
+	getCurrentContext: () => currentContext,
+	getLinkupApiKey: () => currentLinkupApiKey,
+});
 
 /**
  * Parse the verification response from Gemini
@@ -666,6 +225,7 @@ function parseVerificationResponse(
 			"does_not_support",
 			"contradicts",
 			"source_unavailable",
+			"not_applicable",
 		];
 
 		// Parse individual sources
@@ -825,8 +385,8 @@ export async function verifyFootnote(
 						tool: toolName,
 						input,
 						output:
-							outputWithTiming.length > 2000
-								? `${outputWithTiming.slice(0, 2000)}...`
+							outputWithTiming.length > 10000
+								? `${outputWithTiming.slice(0, 10000)}...`
 								: outputWithTiming,
 					});
 

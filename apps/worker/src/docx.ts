@@ -1,3 +1,4 @@
+import { XMLParser } from "fast-xml-parser";
 import JSZip from "jszip";
 
 export interface ParsedFootnote {
@@ -12,18 +13,229 @@ export interface ParsedDocument {
 	footnotes: ParsedFootnote[];
 }
 
+const xmlParser = new XMLParser({
+	ignoreAttributes: false,
+	attributeNamePrefix: "@_",
+	textNodeName: "#text",
+	trimValues: false,
+	processEntities: true,
+});
+
+function asArray<T>(value: T | T[] | undefined | null): T[] {
+	if (!value) {
+		return [];
+	}
+	return Array.isArray(value) ? value : [value];
+}
+
+function findFirstNode(obj: unknown, key: string): unknown | undefined {
+	if (!obj || typeof obj !== "object") {
+		return undefined;
+	}
+
+	if (Object.hasOwn(obj, key)) {
+		return (obj as Record<string, unknown>)[key];
+	}
+
+	for (const value of Object.values(obj as Record<string, unknown>)) {
+		if (Array.isArray(value)) {
+			for (const item of value) {
+				const found = findFirstNode(item, key);
+				if (found !== undefined) {
+					return found;
+				}
+			}
+		} else if (value && typeof value === "object") {
+			const found = findFirstNode(value, key);
+			if (found !== undefined) {
+				return found;
+			}
+		}
+	}
+
+	return undefined;
+}
+
 /**
- * Extract all text content from an XML element using regex
- * Since linkedom doesn't support getElementsByTagNameNS well for XML
+ * Extract all text content from a parsed XML node
  */
-function getTextContent(xmlString: string): string {
-	const textMatches = xmlString.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) || [];
-	return textMatches
-		.map((match) => {
-			const content = match.match(/>([^<]*)</);
-			return content ? content[1] : "";
-		})
-		.join("");
+function decodeXmlEntities(text: string): string {
+	if (!text.includes("&")) {
+		return text;
+	}
+
+	return text.replace(
+		/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g,
+		(match, entity: string) => {
+			switch (entity) {
+				case "amp":
+					return "&";
+				case "lt":
+					return "<";
+				case "gt":
+					return ">";
+				case "quot":
+					return '"';
+				case "apos":
+					return "'";
+				default: {
+					if (entity.startsWith("#x")) {
+						const codePoint = Number.parseInt(entity.slice(2), 16);
+						return Number.isNaN(codePoint)
+							? match
+							: String.fromCodePoint(codePoint);
+					}
+					if (entity.startsWith("#")) {
+						const codePoint = Number.parseInt(entity.slice(1), 10);
+						return Number.isNaN(codePoint)
+							? match
+							: String.fromCodePoint(codePoint);
+					}
+					return match;
+				}
+			}
+		},
+	);
+}
+
+function extractTextFromNode(node: unknown): string {
+	if (node === null || node === undefined) {
+		return "";
+	}
+
+	if (typeof node === "string") {
+		return decodeXmlEntities(node);
+	}
+
+	if (typeof node === "number") {
+		return String(node);
+	}
+
+	if (Array.isArray(node)) {
+		return node.map((entry) => extractTextFromNode(entry)).join("");
+	}
+
+	if (typeof node !== "object") {
+		return "";
+	}
+
+	const record = node as Record<string, unknown>;
+	if (record["w:t"] !== undefined) {
+		return extractTextFromNode(record["w:t"]);
+	}
+
+	if (typeof record["#text"] === "string") {
+		return decodeXmlEntities(record["#text"]);
+	}
+
+	let result = "";
+	for (const [key, value] of Object.entries(record)) {
+		if (key.startsWith("@_")) {
+			continue;
+		}
+		// Ignore field instructions like NOTEREF ... \h \* MERGEFORMAT.
+		if (key === "w:instrText" || key === "w:fldChar") {
+			continue;
+		}
+		if (key === "w:footnoteRef") {
+			continue;
+		}
+		if (key === "w:tab") {
+			result += "\t";
+			continue;
+		}
+		if (key === "w:br" || key === "w:cr") {
+			result += "\n";
+			continue;
+		}
+		result += extractTextFromNode(value);
+	}
+	return result;
+}
+
+function extractParagraphText(paragraph: Record<string, unknown>): string {
+	if (paragraph["w:t"] !== undefined) {
+		return extractTextFromNode(paragraph["w:t"]);
+	}
+	return extractTextFromNode(paragraph);
+}
+
+type ParagraphFootnoteRef = {
+	id: string;
+	customMark?: string;
+	marker: string;
+};
+
+function extractParagraphTextWithFootnoteMarkers(
+	paragraph: Record<string, unknown>,
+): { text: string; refs: ParagraphFootnoteRef[] } {
+	const runs = asArray(paragraph["w:r"]);
+	if (runs.length === 0) {
+		return { text: extractParagraphText(paragraph), refs: [] };
+	}
+
+	let text = "";
+	const refs: ParagraphFootnoteRef[] = [];
+	const markerCounts = new Map<string, number>();
+
+	for (const run of runs) {
+		if (!run || typeof run !== "object") {
+			continue;
+		}
+		const runRecord = run as Record<string, unknown>;
+		const runText = extractTextFromNode(runRecord["w:t"]);
+		if (runText) {
+			text += runText;
+		}
+
+		const refNodes = asArray(runRecord["w:footnoteReference"]);
+		if (refNodes.length === 0) {
+			continue;
+		}
+
+		for (const refNode of refNodes) {
+			if (!refNode || typeof refNode !== "object") {
+				continue;
+			}
+			const refRecord = refNode as Record<string, unknown>;
+			const footnoteId = refRecord["@_w:id"];
+			if (typeof footnoteId !== "string") {
+				continue;
+			}
+			const hasCustomMark = refRecord["@_w:customMarkFollows"] === "1";
+			const runTextTrim = runText.trim();
+			const markerIndex = (markerCounts.get(footnoteId) ?? 0) + 1;
+			markerCounts.set(footnoteId, markerIndex);
+			const marker = `[[FN_${footnoteId}_${markerIndex}]]`;
+
+			refs.push({
+				id: footnoteId,
+				customMark: hasCustomMark ? runTextTrim || undefined : undefined,
+				marker,
+			});
+
+			text += marker;
+		}
+	}
+
+	return { text, refs };
+}
+
+function applyFootnoteMarker(
+	text: string,
+	refs: ParagraphFootnoteRef[],
+	targetMarker: string,
+	displayIndex: string,
+): string {
+	let updated = text;
+	for (const ref of refs) {
+		if (ref.marker === targetMarker) {
+			updated = updated.split(ref.marker).join(`[${displayIndex}]`);
+		} else {
+			updated = updated.split(ref.marker).join("");
+		}
+	}
+	return updated;
 }
 
 /**
@@ -31,19 +243,24 @@ function getTextContent(xmlString: string): string {
  */
 function extractFootnoteContents(footnotesXml: string): Map<string, string> {
 	const map = new Map<string, string>();
+	const parsed = xmlParser.parse(footnotesXml);
+	const footnotesNode = findFirstNode(parsed, "w:footnotes");
+	const footnotes = asArray(
+		footnotesNode && typeof footnotesNode === "object"
+			? (footnotesNode as Record<string, unknown>)["w:footnote"]
+			: undefined,
+	);
 
-	// Match footnote elements with their IDs
-	const footnoteRegex =
-		/<w:footnote[^>]*w:id="([^"]+)"[^>]*>([\s\S]*?)<\/w:footnote>/g;
-	const matches = footnotesXml.matchAll(footnoteRegex);
-
-	for (const match of matches) {
-		const id = match[1];
-		const content = match[2];
+	for (const footnote of footnotes) {
+		if (!footnote || typeof footnote !== "object") {
+			continue;
+		}
+		const footnoteRecord = footnote as Record<string, unknown>;
+		const id = footnoteRecord["@_w:id"];
 
 		// Skip separator footnotes (id 0 and -1)
-		if (id && id !== "0" && id !== "-1") {
-			const text = getTextContent(content).trim();
+		if (typeof id === "string" && id !== "0" && id !== "-1") {
+			const text = extractTextFromNode(footnoteRecord).trim();
 			if (text) {
 				map.set(id, text);
 			}
@@ -63,47 +280,23 @@ function extractFootnotesWithContext(
 	const results: ParsedFootnote[] = [];
 	let numericIndex = 1;
 	let orderIndex = 1;
+	const parsed = xmlParser.parse(documentXml);
+	const bodyNode = findFirstNode(parsed, "w:body");
+	const paragraphs = asArray(
+		bodyNode && typeof bodyNode === "object"
+			? (bodyNode as Record<string, unknown>)["w:p"]
+			: undefined,
+	);
 
-	// Extract paragraphs
-	const paragraphRegex = /<w:p[^>]*>([\s\S]*?)<\/w:p>/g;
-	const paragraphs: string[] = [];
-
-	for (const paraMatch of documentXml.matchAll(paragraphRegex)) {
-		paragraphs.push(paraMatch[1]);
-	}
-
-	// For each paragraph, find footnote references and extract context
 	for (let pIdx = 0; pIdx < paragraphs.length; pIdx++) {
 		const para = paragraphs[pIdx];
-		const paraText = getTextContent(para);
-
-		// Find footnote references in this paragraph, including custom marks
-		const runRegex = /<w:r[^>]*>[\s\S]*?<\/w:r>/g;
-		const refs: Array<{ id: string; customMark?: string }> = [];
-
-		for (const runMatch of para.matchAll(runRegex)) {
-			const runXml = runMatch[0];
-			const refRegex = /<w:footnoteReference\b[^>]*\/?>/g;
-
-			for (const refMatch of runXml.matchAll(refRegex)) {
-				const refTag = refMatch[0];
-				const idMatch = refTag.match(/w:id="([^"]+)"/);
-				const footnoteId = idMatch?.[1];
-				if (!footnoteId) {
-					continue;
-				}
-				const hasCustomMark = /w:customMarkFollows="1"/.test(refTag);
-				let customMark: string | undefined;
-
-				if (hasCustomMark) {
-					const afterRef = runXml.slice(refMatch.index + refTag.length);
-					const markMatch = afterRef.match(/<w:t[^>]*>([^<]*)<\/w:t>/);
-					customMark = markMatch?.[1]?.trim() || undefined;
-				}
-
-				refs.push({ id: footnoteId, customMark });
-			}
+		if (!para || typeof para !== "object") {
+			continue;
 		}
+		const paraRecord = para as Record<string, unknown>;
+		const { text: paraTextWithMarkers, refs } =
+			extractParagraphTextWithFootnoteMarkers(paraRecord);
+		const paraText = paraTextWithMarkers;
 
 		for (const ref of refs) {
 			const footnoteId = ref.id;
@@ -114,7 +307,11 @@ function extractFootnotesWithContext(
 
 				// If paragraph is too short, include adjacent paragraphs
 				if (claim.length < 20 && pIdx > 0) {
-					const prevText = getTextContent(paragraphs[pIdx - 1]);
+					const prevPara = paragraphs[pIdx - 1];
+					const prevText =
+						prevPara && typeof prevPara === "object"
+							? extractParagraphText(prevPara as Record<string, unknown>)
+							: "";
 					claim = `${prevText.trim()} ${claim}`;
 				}
 
@@ -132,13 +329,20 @@ function extractFootnotesWithContext(
 				const displayIndex = isCustomMark
 					? ref.customMark || "?"
 					: String(numericIndex);
+				const claimWithRef = applyFootnoteMarker(
+					claim,
+					refs,
+					ref.marker,
+					displayIndex,
+				);
+				const finalClaim = claimWithRef.trim() || "(No context found)";
 				const index = isCustomMark ? 0 : numericIndex;
 
 				results.push({
 					index,
 					displayIndex,
 					order: orderIndex,
-					claim: claim || "(No context found)",
+					claim: finalClaim,
 					citation,
 				});
 

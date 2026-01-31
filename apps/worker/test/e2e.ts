@@ -189,6 +189,7 @@ function formatVerdict(verdict: string): string {
 		does_not_support: "\x1b[31m✗ DOES NOT SUPPORT\x1b[0m",
 		contradicts: "\x1b[31m✗✗ CONTRADICTS\x1b[0m",
 		source_unavailable: "\x1b[90m? SOURCE UNAVAILABLE\x1b[0m",
+		not_applicable: "\x1b[36m∅ NOT APPLICABLE\x1b[0m",
 	};
 	return colors[verdict] || verdict;
 }
