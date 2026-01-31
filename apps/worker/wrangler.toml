@@ -12,3 +12,12 @@ bucket_name = "cider-documents"
 
 # For local development, create a preview bucket
 # Run: wrangler r2 bucket create cider-documents
+
+[durable_objects]
+bindings = [
+	{ name = "PROGRESS_DO", class_name = "ProgressDurableObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProgressDurableObject"]

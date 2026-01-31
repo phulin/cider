@@ -13,7 +13,10 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const API_BASE = process.env.API_URL || "http://localhost:8787";
-const TEST_FILE = resolve(__dirname, "../../../adams-black.docx");
+const DEFAULT_TEST_FILE = resolve(__dirname, "../../../ai-errors-mini.docx");
+const TEST_FILE =
+	process.env.TEST_FILE ||
+	(process.argv[2] ? resolve(process.argv[2]) : DEFAULT_TEST_FILE);
 
 interface Document {
 	id: string;
@@ -70,7 +73,8 @@ async function uploadDocument(filePath: string): Promise<string> {
 
 async function pollForResults(
 	id: string,
-	maxAttempts = 60,
+	maxAttempts = Number(process.env.MAX_ATTEMPTS || 120),
+	pollIntervalMs = Number(process.env.POLL_INTERVAL_MS || 3000),
 ): Promise<DocumentResult> {
 	for (let i = 0; i < maxAttempts; i++) {
 		const response = await fetch(`${API_BASE}/api/documents/${id}`);
@@ -92,10 +96,90 @@ async function pollForResults(
 		console.log(
 			`  Waiting... (${i + 1}/${maxAttempts}) - ${result.verifications.length}/${result.footnotes.length} verified`,
 		);
-		await new Promise((resolve) => setTimeout(resolve, 3000));
+		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
 	}
 
 	throw new Error("Timeout waiting for results");
+}
+
+function buildStreamUrl(id: string): string {
+	const base = new URL(API_BASE);
+	base.protocol = base.protocol === "https:" ? "wss:" : "ws:";
+	return `${base.toString().replace(/\/$/, "")}/api/documents/${id}/stream`;
+}
+
+async function streamForResults(
+	id: string,
+	timeoutMs = Number(process.env.WS_TIMEOUT_MS || 10 * 60 * 1000),
+): Promise<DocumentResult> {
+	const WebSocketImpl = (
+		globalThis as unknown as { WebSocket?: typeof WebSocket }
+	).WebSocket;
+	if (!WebSocketImpl) {
+		throw new Error("WebSocket is not available in this runtime");
+	}
+
+	return await new Promise<DocumentResult>((resolve, reject) => {
+		const ws = new WebSocketImpl(buildStreamUrl(id));
+		const timer = setTimeout(() => {
+			ws.close();
+			reject(new Error("Timeout waiting for WebSocket results"));
+		}, timeoutMs);
+
+		ws.addEventListener("message", async (event) => {
+			try {
+				const payload = JSON.parse(event.data as string) as {
+					type: string;
+					data?: {
+						status: "processing" | "complete" | "failed";
+						footnoteCount: number;
+						verifications: Verification[];
+						error?: string;
+					};
+				};
+
+				if (payload.type !== "progress" || !payload.data) return;
+
+				console.log(
+					`  [ws] ${payload.data.verifications.length}/${payload.data.footnoteCount} verified`,
+				);
+
+				if (payload.data.status === "failed") {
+					clearTimeout(timer);
+					ws.close();
+					reject(
+						new Error(
+							`Processing failed: ${payload.data.error ?? "Unknown error"}`,
+						),
+					);
+					return;
+				}
+
+				if (payload.data.status === "complete") {
+					clearTimeout(timer);
+					ws.close();
+					const result = await getDocument(id);
+					resolve(result);
+				}
+			} catch (err) {
+				clearTimeout(timer);
+				ws.close();
+				reject(
+					err instanceof Error ? err : new Error("WebSocket message error"),
+				);
+			}
+		});
+
+		ws.addEventListener("error", () => {
+			clearTimeout(timer);
+			ws.close();
+			reject(new Error("WebSocket error"));
+		});
+
+		ws.addEventListener("close", () => {
+			clearTimeout(timer);
+		});
+	});
 }
 
 function formatVerdict(verdict: string): string {
@@ -131,9 +215,15 @@ async function main() {
 	const id = await uploadDocument(TEST_FILE);
 	console.log(`  Document ID: ${id}\n`);
 
-	// Poll for results
+	// Stream results (WebSocket) with polling fallback
 	console.log("⏳ Processing...");
-	const result = await pollForResults(id);
+	const useWs = String(process.env.USE_WS || "true").toLowerCase() !== "false";
+	const result = useWs
+		? await streamForResults(id).catch((err) => {
+				console.warn(`  WS failed (${err.message}); falling back to polling.`);
+				return pollForResults(id);
+			})
+		: await pollForResults(id);
 	console.log(`\n✓ Processing complete!\n`);
 
 	// Display results
@@ -163,7 +253,7 @@ async function main() {
 		const v = verificationMap.get(footnote.id);
 
 		console.log(
-			`\n[${footnote.index}] ${v ? formatVerdict(v.verdict) : "PENDING"}`,
+			`\n[${footnote.displayIndex ?? footnote.index}] ${v ? formatVerdict(v.verdict) : "PENDING"}`,
 		);
 		console.log(
 			`    Claim: "${footnote.claim.slice(0, 100)}${footnote.claim.length > 100 ? "..." : ""}"`,

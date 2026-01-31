@@ -11,6 +11,8 @@ export interface Footnote {
 	id: string;
 	documentId: string;
 	index: number;
+	displayIndex?: string;
+	order?: number;
 	claim: string;
 	citation: string;
 }

@@ -2,6 +2,8 @@ import JSZip from "jszip";
 
 export interface ParsedFootnote {
 	index: number;
+	displayIndex: string;
+	order: number;
 	claim: string;
 	citation: string;
 }
@@ -59,6 +61,8 @@ function extractFootnotesWithContext(
 	footnoteContents: Map<string, string>,
 ): ParsedFootnote[] {
 	const results: ParsedFootnote[] = [];
+	let numericIndex = 1;
+	let orderIndex = 1;
 
 	// Extract paragraphs
 	const paragraphRegex = /<w:p[^>]*>([\s\S]*?)<\/w:p>/g;
@@ -73,11 +77,36 @@ function extractFootnotesWithContext(
 		const para = paragraphs[pIdx];
 		const paraText = getTextContent(para);
 
-		// Find footnote references in this paragraph
-		const refRegex = /<w:footnoteReference[^>]*w:id="([^"]+)"[^>]*\/?>/g;
+		// Find footnote references in this paragraph, including custom marks
+		const runRegex = /<w:r[^>]*>[\s\S]*?<\/w:r>/g;
+		const refs: Array<{ id: string; customMark?: string }> = [];
 
-		for (const refMatch of para.matchAll(refRegex)) {
-			const footnoteId = refMatch[1];
+		for (const runMatch of para.matchAll(runRegex)) {
+			const runXml = runMatch[0];
+			const refRegex = /<w:footnoteReference\b[^>]*\/?>/g;
+
+			for (const refMatch of runXml.matchAll(refRegex)) {
+				const refTag = refMatch[0];
+				const idMatch = refTag.match(/w:id="([^"]+)"/);
+				const footnoteId = idMatch?.[1];
+				if (!footnoteId) {
+					continue;
+				}
+				const hasCustomMark = /w:customMarkFollows="1"/.test(refTag);
+				let customMark: string | undefined;
+
+				if (hasCustomMark) {
+					const afterRef = runXml.slice(refMatch.index + refTag.length);
+					const markMatch = afterRef.match(/<w:t[^>]*>([^<]*)<\/w:t>/);
+					customMark = markMatch?.[1]?.trim() || undefined;
+				}
+
+				refs.push({ id: footnoteId, customMark });
+			}
+		}
+
+		for (const ref of refs) {
+			const footnoteId = ref.id;
 
 			if (footnoteContents.has(footnoteId)) {
 				// Use the paragraph text as context, or get surrounding paragraphs
@@ -99,11 +128,24 @@ function extractFootnotesWithContext(
 					continue;
 				}
 
+				const isCustomMark = Boolean(ref.customMark);
+				const displayIndex = isCustomMark
+					? ref.customMark || "?"
+					: String(numericIndex);
+				const index = isCustomMark ? 0 : numericIndex;
+
 				results.push({
-					index: results.length + 1,
+					index,
+					displayIndex,
+					order: orderIndex,
 					claim: claim || "(No context found)",
 					citation,
 				});
+
+				orderIndex += 1;
+				if (!isCustomMark) {
+					numericIndex += 1;
+				}
 			}
 		}
 	}

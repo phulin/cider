@@ -13,21 +13,41 @@ export interface DocumentResult {
 	verifications: Verification[];
 }
 
-export async function uploadDocument(file: File): Promise<UploadResponse> {
+export async function uploadDocument(
+	file: File,
+	onProgress?: (percent: number) => void,
+): Promise<UploadResponse> {
 	const formData = new FormData();
 	formData.append("document", file);
 
-	const response = await fetch(`${API_BASE}/api/documents`, {
-		method: "POST",
-		body: formData,
+	return new Promise((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		xhr.open("POST", `${API_BASE}/api/documents`);
+		xhr.responseType = "json";
+
+		xhr.upload.onprogress = (event) => {
+			if (!event.lengthComputable || !onProgress) return;
+			const percent = Math.round((event.loaded / event.total) * 100);
+			onProgress(Math.min(100, Math.max(0, percent)));
+		};
+
+		xhr.onload = () => {
+			if (xhr.status >= 200 && xhr.status < 300) {
+				resolve(xhr.response as UploadResponse);
+				return;
+			}
+			const errorMessage =
+				(xhr.response && (xhr.response as { error?: string }).error) ||
+				"Upload failed";
+			reject(new Error(errorMessage));
+		};
+
+		xhr.onerror = () => {
+			reject(new Error("Upload failed"));
+		};
+
+		xhr.send(formData);
 	});
-
-	if (!response.ok) {
-		const error = await response.json();
-		throw new Error(error.error || "Upload failed");
-	}
-
-	return response.json();
 }
 
 export async function getDocument(id: string): Promise<DocumentResult> {
@@ -51,4 +71,10 @@ export async function deleteDocument(id: string): Promise<void> {
 	if (!response.ok) {
 		throw new Error("Failed to delete document");
 	}
+}
+
+export function documentStreamUrl(id: string): string {
+	const url = new URL(API_BASE);
+	url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+	return `${url.toString().replace(/\/$/, "")}/api/documents/${id}/stream`;
 }

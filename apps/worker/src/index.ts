@@ -7,6 +7,7 @@ import type {
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { parseDocx } from "./docx";
+import { ProgressDurableObject, type ProgressUpdate } from "./progress";
 import type { Env } from "./types";
 import { verifyAllFootnotes } from "./verify";
 
@@ -24,6 +25,14 @@ app.use(
 
 // Health check
 app.get("/", (c) => c.json({ status: "ok", service: "cider-api" }));
+
+// WebSocket stream for document progress
+app.get("/api/documents/:id/stream", (c) => {
+	const id = c.req.param("id");
+	const durableId = c.env.PROGRESS_DO.idFromName(id);
+	const stub = c.env.PROGRESS_DO.get(durableId);
+	return stub.fetch(c.req.raw);
+});
 
 // Upload document
 app.post("/api/documents", async (c) => {
@@ -66,6 +75,8 @@ app.post("/api/documents", async (c) => {
 			id: `${id}-fn-${idx + 1}`,
 			documentId: id,
 			index: fn.index,
+			displayIndex: fn.displayIndex,
+			order: fn.order,
 			claim: fn.claim,
 			citation: fn.citation,
 		}));
@@ -156,51 +167,119 @@ async function processDocument(
 	footnotes: Footnote[],
 ): Promise<void> {
 	try {
+		const writeResults = async (
+			status: Document["status"],
+			verifications: Verification[],
+			error?: string,
+		) => {
+			const updatedDocument: Document = {
+				...document,
+				status,
+				...(error ? { error } : {}),
+			};
+
+			const payload: ProgressUpdate = {
+				status,
+				footnoteCount: footnotes.length,
+				verifications,
+				error,
+			};
+
+			await Promise.all([
+				env.BUCKET.put(
+					`documents/${id}/results.json`,
+					JSON.stringify({
+						document: updatedDocument,
+						footnotes,
+						verifications,
+					}),
+				),
+				notifyProgress(env, id, payload),
+			]);
+		};
+
+		if (!env.GEMINI_API_KEY) {
+			await writeResults("failed", [], "GEMINI_API_KEY is not set");
+			return;
+		}
+		if (!env.LINKUP_API_KEY) {
+			console.log(
+				"[verify] LINKUP_API_KEY is not set; web_search tool will be unavailable.",
+			);
+		}
+
+		// Write initial processing state so the UI can show progress.
+		await writeResults("processing", []);
+
 		// Verify all footnotes
 		const verifications = await verifyAllFootnotes(
 			env.GEMINI_API_KEY,
+			env.LINKUP_API_KEY,
 			footnotes.map((fn) => ({
 				id: fn.id,
 				index: fn.index,
+				displayIndex: fn.displayIndex,
+				order: fn.order,
 				claim: fn.claim,
 				citation: fn.citation,
 			})),
+			{
+				timeoutMs: 60000,
+				onProgress: async (current) => {
+					await writeResults("processing", current);
+				},
+			},
 		);
 
-		// Update document status
-		const updatedDocument: Document = {
-			...document,
-			status: "complete",
-		};
-
-		// Store results
-		await env.BUCKET.put(
-			`documents/${id}/results.json`,
-			JSON.stringify({
-				document: updatedDocument,
-				footnotes,
-				verifications,
-			}),
-		);
+		await writeResults("complete", verifications);
 	} catch (error) {
 		console.error("Processing error:", error);
 
-		// Store error state
 		const errorDocument: Document = {
 			...document,
 			status: "failed",
 			error: error instanceof Error ? error.message : "Processing failed",
 		};
 
-		await env.BUCKET.put(
-			`documents/${id}/results.json`,
-			JSON.stringify({
-				document: errorDocument,
-				footnotes,
-				verifications: [],
-			}),
-		);
+		const payload: ProgressUpdate = {
+			status: "failed",
+			footnoteCount: footnotes.length,
+			verifications: [],
+			error: errorDocument.error,
+		};
+
+		await Promise.all([
+			env.BUCKET.put(
+				`documents/${id}/results.json`,
+				JSON.stringify({
+					document: errorDocument,
+					footnotes,
+					verifications: [],
+				}),
+			),
+			notifyProgress(env, id, payload),
+		]);
 	}
 }
 
 export default app;
+export { ProgressDurableObject };
+
+async function notifyProgress(
+	env: Env,
+	id: string,
+	payload: ProgressUpdate,
+): Promise<void> {
+	const durableId = env.PROGRESS_DO.idFromName(id);
+	const stub = env.PROGRESS_DO.get(durableId);
+
+	try {
+		await stub.fetch("https://progress/progress", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(payload),
+		});
+	} catch (error) {
+		console.warn("[progress] Failed to notify durable object:", error);
+	}
+}

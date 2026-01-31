@@ -1,7 +1,7 @@
 import type { Footnote, Verdict, Verification } from "@cider/shared";
 import { useParams } from "@solidjs/router";
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
-import { type DocumentResult, getDocument } from "~/lib/api";
+import { type DocumentResult, documentStreamUrl, getDocument } from "~/lib/api";
 
 const verdictConfig: Record<
 	Verdict,
@@ -37,6 +37,10 @@ const verdictConfig: Record<
 function FootnoteCard(props: {
 	footnote: Footnote;
 	verification?: Verification;
+	traceOpen?: boolean;
+	onTraceToggle?: (open: boolean) => void;
+	traceOutputOpenByIndex?: Record<number, boolean>;
+	onTraceOutputToggle?: (index: number, open: boolean) => void;
 }) {
 	const config = () =>
 		props.verification
@@ -49,7 +53,7 @@ function FootnoteCard(props: {
 				<div class="flex-1 min-w-0">
 					<div class="flex items-center gap-2 mb-2">
 						<span class="font-mono text-sm text-gray-500">
-							[{props.footnote.index}]
+							[{props.footnote.displayIndex ?? props.footnote.index}]
 						</span>
 						<Show when={props.verification}>
 							<span class={`text-sm font-medium ${config().color}`}>
@@ -90,7 +94,15 @@ function FootnoteCard(props: {
 							props.verification?.trace && props.verification.trace.length > 0
 						}
 					>
-						<details class="mt-3">
+						<details
+							class="mt-3"
+							open={props.traceOpen}
+							onToggle={(event) =>
+								props.onTraceToggle?.(
+									(event.currentTarget as HTMLDetailsElement).open,
+								)
+							}
+						>
 							<summary class="text-xs text-gray-500 cursor-pointer hover:text-gray-700">
 								Show agent trace ({props.verification?.trace?.length} tool
 								calls)
@@ -110,7 +122,16 @@ function FootnoteCard(props: {
 													{JSON.stringify(call.input)}
 												</code>
 											</div>
-											<details class="mt-1">
+											<details
+												class="mt-1"
+												open={props.traceOutputOpenByIndex?.[index()] ?? false}
+												onToggle={(event) =>
+													props.onTraceOutputToggle?.(
+														index(),
+														(event.currentTarget as HTMLDetailsElement).open,
+													)
+												}
+											>
 												<summary class="text-gray-500 cursor-pointer hover:text-gray-700">
 													Output ({call.output.length} chars)
 												</summary>
@@ -134,7 +155,12 @@ export default function DocumentPage() {
 	const params = useParams();
 	const [result, setResult] = createSignal<DocumentResult | null>(null);
 	const [error, setError] = createSignal<string | null>(null);
-	const [polling, setPolling] = createSignal(true);
+	const [polling, setPolling] = createSignal(false);
+	const [traceOpenByFootnote, setTraceOpenByFootnote] = createSignal<
+		Record<string, boolean>
+	>({});
+	const [traceOutputOpenByFootnote, setTraceOutputOpenByFootnote] =
+		createSignal<Record<string, Record<number, boolean>>>({});
 
 	const fetchDocument = async () => {
 		try {
@@ -153,14 +179,85 @@ export default function DocumentPage() {
 		}
 	};
 
-	// Initial fetch and polling
+	// Initial fetch on id change
 	createEffect(() => {
+		if (!params.id) return;
+		fetchDocument();
+	});
+
+	// WebSocket stream
+	createEffect(() => {
+		const id = params.id;
+		if (!id) return;
+
+		let closed = false;
+		const ws = new WebSocket(documentStreamUrl(id));
+
+		ws.addEventListener("open", () => {
+			setPolling(false);
+		});
+
+		ws.addEventListener("message", (event) => {
+			try {
+				const payload = JSON.parse(event.data as string) as {
+					type: string;
+					data?: {
+						status: "processing" | "complete" | "failed";
+						footnoteCount: number;
+						verifications: Verification[];
+						error?: string;
+					};
+				};
+
+				if (payload.type !== "progress" || !payload.data) return;
+				const data = payload.data;
+
+				setResult((prev) => {
+					if (!prev) return prev;
+					return {
+						...prev,
+						document: {
+							...prev.document,
+							status: data.status,
+							footnoteCount: data.footnoteCount,
+							...(data.error ? { error: data.error } : {}),
+						},
+						verifications: data.verifications,
+					};
+				});
+
+				if (data.status !== "processing" && !closed) {
+					closed = true;
+					ws.close();
+				}
+			} catch (err) {
+				console.warn("Failed to parse progress message", err);
+			}
+		});
+
+		const handleClose = () => {
+			const status = result()?.document.status;
+			if (!status || status === "processing") {
+				setPolling(true);
+			}
+		};
+
+		ws.addEventListener("close", handleClose);
+		ws.addEventListener("error", handleClose);
+
+		onCleanup(() => {
+			closed = true;
+			ws.close();
+		});
+	});
+
+	// Polling fallback when WS is unavailable
+	createEffect(() => {
+		if (!polling()) return;
 		fetchDocument();
 
 		const interval = setInterval(() => {
-			if (polling()) {
-				fetchDocument();
-			}
+			fetchDocument();
 		}, 3000);
 
 		onCleanup(() => clearInterval(interval));
@@ -191,6 +288,16 @@ export default function DocumentPage() {
 		}
 
 		return counts;
+	};
+
+	const verificationProgress = () => {
+		const footnoteCount = result()?.document.footnoteCount ?? 0;
+		if (footnoteCount === 0) return 0;
+		const verified = result()?.verifications.length ?? 0;
+		return Math.min(
+			100,
+			Math.max(0, Math.round((verified / footnoteCount) * 100)),
+		);
 	};
 
 	return (
@@ -228,9 +335,34 @@ export default function DocumentPage() {
 							</span>
 						}
 					>
-						<div class="flex items-center gap-2">
-							<div class="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-							<span class="text-sm text-gray-600">Verifying citations...</span>
+						<div class="flex flex-col items-end gap-2">
+							<div class="flex items-center gap-2">
+								<div class="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+								<span class="text-sm text-gray-600">
+									Verifying citations...
+								</span>
+							</div>
+							<div class="w-64 space-y-1">
+								<div class="flex items-center justify-between text-xs text-gray-500">
+									<span>
+										{result()?.verifications.length ?? 0} of{" "}
+										{result()?.document.footnoteCount ?? 0} verified
+									</span>
+									<span>{verificationProgress()}%</span>
+								</div>
+								<div
+									class="h-2 w-full overflow-hidden rounded-full bg-gray-200"
+									role="progressbar"
+									aria-valuemin="0"
+									aria-valuemax="100"
+									aria-valuenow={verificationProgress()}
+								>
+									<div
+										class="h-full rounded-full bg-blue-600 transition-all duration-300"
+										style={{ width: `${verificationProgress()}%` }}
+									/>
+								</div>
+							</div>
 						</div>
 					</Show>
 				</div>
@@ -262,6 +394,25 @@ export default function DocumentPage() {
 							<FootnoteCard
 								footnote={footnote}
 								verification={verificationMap().get(footnote.id)}
+								traceOpen={traceOpenByFootnote()[footnote.id] ?? false}
+								onTraceToggle={(open) =>
+									setTraceOpenByFootnote((prev) => ({
+										...prev,
+										[footnote.id]: open,
+									}))
+								}
+								traceOutputOpenByIndex={
+									traceOutputOpenByFootnote()[footnote.id] ?? {}
+								}
+								onTraceOutputToggle={(index, open) =>
+									setTraceOutputOpenByFootnote((prev) => ({
+										...prev,
+										[footnote.id]: {
+											...(prev[footnote.id] ?? {}),
+											[index]: open,
+										},
+									}))
+								}
 							/>
 						)}
 					</For>

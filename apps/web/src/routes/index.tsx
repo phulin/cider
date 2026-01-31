@@ -6,6 +6,7 @@ export default function Home() {
 	const navigate = useNavigate();
 	const [file, setFile] = createSignal<File | null>(null);
 	const [uploading, setUploading] = createSignal(false);
+	const [progress, setProgress] = createSignal(0);
 	const [error, setError] = createSignal<string | null>(null);
 	const [dragOver, setDragOver] = createSignal(false);
 
@@ -30,14 +31,17 @@ export default function Home() {
 		if (!f) return;
 
 		setUploading(true);
+		setProgress(0);
 		setError(null);
 
 		try {
-			const result = await uploadDocument(f);
+			const result = await uploadDocument(f, setProgress);
+			setProgress(100);
 			navigate(`/documents/${result.id}`);
 		} catch (e) {
 			setError(e instanceof Error ? e.message : "Upload failed");
 			setUploading(false);
+			setProgress(0);
 		}
 	};
 
@@ -104,18 +108,40 @@ export default function Home() {
 			)}
 
 			<div class="flex justify-center">
-				<button
-					type="button"
-					onClick={handleUpload}
-					disabled={!file() || uploading()}
-					class={`px-6 py-3 rounded-md font-medium text-white transition-colors ${
-						!file() || uploading()
-							? "bg-gray-300 cursor-not-allowed"
-							: "bg-blue-600 hover:bg-blue-700"
-					}`}
-				>
-					{uploading() ? "Uploading..." : "Check Citations"}
-				</button>
+				<div class="w-full max-w-md space-y-3">
+					<button
+						type="button"
+						onClick={handleUpload}
+						disabled={!file() || uploading()}
+						class={`w-full px-6 py-3 rounded-md font-medium text-white transition-colors ${
+							!file() || uploading()
+								? "bg-gray-300 cursor-not-allowed"
+								: "bg-blue-600 hover:bg-blue-700"
+						}`}
+					>
+						{uploading() ? "Uploading..." : "Check Citations"}
+					</button>
+					{uploading() && (
+						<div class="space-y-2">
+							<div class="flex items-center justify-between text-xs text-gray-500">
+								<span>Uploading document</span>
+								<span>{progress()}%</span>
+							</div>
+							<div
+								class="h-2 w-full overflow-hidden rounded-full bg-gray-200"
+								role="progressbar"
+								aria-valuemin="0"
+								aria-valuemax="100"
+								aria-valuenow={progress()}
+							>
+								<div
+									class="h-full rounded-full bg-blue-600 transition-all duration-200"
+									style={{ width: `${progress()}%` }}
+								/>
+							</div>
+						</div>
+					)}
+				</div>
 			</div>
 
 			<div class="mt-12 text-center text-sm text-gray-500">

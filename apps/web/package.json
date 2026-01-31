@@ -11,15 +11,15 @@
 	},
 	"dependencies": {
 		"@cider/shared": "workspace:*",
-		"@solidjs/router": "^0.15.0",
-		"@solidjs/start": "^1.0.0",
-		"solid-js": "^1.9.0",
-		"vinxi": "^0.5.0"
+		"@solidjs/router": "^0.15.4",
+		"@solidjs/start": "^1.2.1",
+		"solid-js": "^1.9.11",
+		"vinxi": "^0.5.11"
 	},
 	"devDependencies": {
-		"@tailwindcss/vite": "^4.0.0",
-		"autoprefixer": "^10.4.20",
-		"tailwindcss": "^4.0.0",
-		"typescript": "^5.7.0"
+		"@tailwindcss/vite": "^4.1.18",
+		"autoprefixer": "^10.4.24",
+		"tailwindcss": "^4.1.18",
+		"typescript": "^5.9.3"
 	}
 }
